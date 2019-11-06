@@ -8,57 +8,54 @@
 #include <linux/limits.h>
 #include <mmu.h>
 
-char argvs[ARG_MAX][PAGE_SIZE];
+char **argvs = NULL;
 int argv_c = 0;
 
 static int get_argv_from_bprm(struct linux_binprm *bprm) {
 	int ret = 0;
 	unsigned long offset, pos;
-	char *kaddr;
-	struct page *page;
+	char *kaddr = NULL;
+	struct page *page = NULL;
 	char *argv = NULL;
 	int i = 0;
 	int argc = 0;
-	//int envc = 0;
 	int count = 0;
 	argv = vzalloc(PAGE_SIZE);
 	if (!bprm || !argv) {
+		ret = -EFAULT;
 		goto out;
 	}
-
 	argc = bprm->argc;
-	//envc = bprm->envc;
 	pos = bprm->p;
+	i = 0;
+	offset = pos & ~PAGE_MASK;
 	do {
-		offset = pos & ~PAGE_MASK;
 		page = get_arg_page(bprm, pos, 0);
 		if (!page) {
-			ret = 0;
+			ret = -EFAULT;
 			goto out;
 		}
 		kaddr = kmap_atomic(page);
-
-		for (i = 0; offset < PAGE_SIZE && count < argc/* + envc*/  && i < PAGE_SIZE; offset++, pos++) {
+		for (/* Do nothing */; offset < PAGE_SIZE && count < argc && i < PAGE_SIZE; offset++, pos++) {
+			argv[i++] = kaddr[offset];
 			if (kaddr[offset] == '\0') {
 				count++;
 				pos++;
-				//printk("page info is %s\n", argv);
-				memcpy(argvs[argv_c++], argv, strlen(argv));
-				memset(argv, 0, sizeof(argv));
+				memcpy(argvs[argv_c++], argv, strlen(argv) + 1);
 				i = 0;
 				continue;
 			}
-			argv[i] = kaddr[offset];
-			i++;
 		}
-		
 		kunmap_atomic(kaddr);
 		put_arg_page(page);
-	} while (offset == PAGE_SIZE);
-
+		offset = 0;
+	} while (count < argc);
 	ret = 0;
-
 out:
+	if (argv) {
+		vfree(argv);
+		argv = NULL;
+	}
 	return ret;
 }
 
@@ -67,20 +64,59 @@ static int my_bprm_check_security(struct linux_binprm *bprm) {
 	int i;
 	int len = 0;
 	int insert_c = 0;
-	if (!strcmp(bprm->filename, "/usr/bin/ls")) {
+	int index;
+	if (!strcmp(bprm->filename, "/usr/libexec/qemu-kvm")) {
 		printk("RUNING: %s\n", bprm->filename);
+		argvs = vzalloc(bprm->argc * sizeof(char*));
+		if (!argvs) {
+			ret = -EFAULT;
+			goto out;
+		}
+		for (i = 0; i < bprm->argc; i++) {
+			argvs[i] = vzalloc(PAGE_SIZE);
+			memset(argvs[i], 0, PAGE_SIZE);
+		}
 		ret = get_argv_from_bprm(bprm);
 		for (i = 0; i < argv_c; i++) {
-			//printk("%s\n", argvs[i]);
+			printk("%s\n", argvs[i]);
 			len += strlen(argvs[i]);
 		}
 		len += argv_c;
+		printk("len: %d\n", len);
 		bprm->p += len;
-		insert_c = 3;
-		char *insert[3] = {"-a", "-l", "-F"};
+		insert_c = 4;
+		char *insert[4] = {
+			"-tpmdev",
+			"passthrough,id=tpm0,path=/dev/vtcm1,cancel-path=/dev/null",
+			"-device",
+			"tpm-tis,tpmdev=tpm0"
+		};
 		copy_strings_kernel(insert_c, insert, bprm);
-		copy_strings_kernel(argv_c + 1, argvs, bprm);
+		bprm->argc += insert_c;
+		// copy_strings_kernel(argv_c, argvs, bprm);
+		// int i = 0;
+		// while (i < argv_c) {
+		// 	copy_strings_kernel(((i + 10 < argv_c) ? 10 : (argv_c - i)), &argvs[i], bprm);
+		// 	i += 10;
+		// }
+		i = (argv_c % 10) ? argv_c / 10 + 1 : argv_c / 10;
+		index = (--i) * 10;
+		copy_strings_kernel(argv_c - index, argvs + index, bprm);
+		while (i > 0) {
+			index -= 10;
+			copy_strings_kernel(10, argvs + index, bprm);
+			i--;
+		}
+		argv_c = 0;
+		if (argvs) {
+			for (i = 0; i < bprm->argc; i++) {
+				vfree(argvs[i]);
+			}
+			vfree(argvs);
+			argvs = NULL;
+		}
 	}
+out:
 	return ret;
 }
 
